@@ -1,3 +1,3 @@
-module example.com/go_module
+module github.com/makadev/go-runner
 
-go 1.24.3
+go 1.26.1

@@ -9,9 +9,9 @@ Remove the existing `go.mod` and `go.sum` as well as the `*.go` files and create
 ```
 rm -f go.mod go.sum
 rm -f *.go
-echo "package main" > main.go
-echo "package main" > main_test.go
-go mod init github.com/your-username/your-repo
+echo "package runner" > main.go
+echo "package runner" > main_test.go
+go mod init github.com/makadev/go-runner
 go mod tidy
 ```
 
