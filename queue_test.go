@@ -22,6 +22,7 @@ type recordingStore struct {
 	claimErr error
 
 	markSucceededIDs []int64
+	markSucceededErr error
 	markRetryCalls   []struct {
 		id    int64
 		err   string
@@ -31,6 +32,7 @@ type recordingStore struct {
 		id  int64
 		err string
 	}
+	markFailedErr error
 }
 
 func (s *recordingStore) CreateJob(ctx context.Context, typ string, payload json.RawMessage, opt EnqueueOptions) (Job, error) {
@@ -61,6 +63,9 @@ func (s *recordingStore) ClaimJob(ctx context.Context, id int64, lockedBy string
 func (s *recordingStore) MarkSucceeded(ctx context.Context, id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.markSucceededErr != nil {
+		return s.markSucceededErr
+	}
 	s.markSucceededIDs = append(s.markSucceededIDs, id)
 	return nil
 }
@@ -79,6 +84,9 @@ func (s *recordingStore) MarkRetry(ctx context.Context, id int64, lastError stri
 func (s *recordingStore) MarkFailed(ctx context.Context, id int64, lastError string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.markFailedErr != nil {
+		return s.markFailedErr
+	}
 	s.markFailedCalls = append(s.markFailedCalls, struct {
 		id  int64
 		err string
@@ -238,5 +246,79 @@ func TestQueue_InlineClaimError(t *testing.T) {
 	_, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
 	if !errors.Is(err, dbErr) {
 		t.Fatalf("expected db error, got %v", err)
+	}
+}
+
+func TestQueue_EnqueueMarshalError(t *testing.T) {
+	st := &recordingStore{createJob: Job{ID: 1, Type: "t"}}
+	q := &Queue{Store: st}
+
+	// Functions cannot be marshalled to JSON.
+	_, err := q.Enqueue(context.Background(), "t", func() {}, EnqueueOptions{})
+	if err == nil {
+		t.Fatalf("expected marshal error")
+	}
+}
+
+func TestQueue_EnqueueCreateJobError(t *testing.T) {
+	createErr := errors.New("insert failed")
+	st := &recordingStore{createErr: createErr}
+	q := &Queue{Store: st}
+
+	_, err := q.Enqueue(context.Background(), "t", map[string]any{}, EnqueueOptions{})
+	if !errors.Is(err, createErr) {
+		t.Fatalf("expected create error, got %v", err)
+	}
+}
+
+func TestQueue_InlineErrNotClaimedReturnsSuccess(t *testing.T) {
+	st := &recordingStore{
+		createJob: Job{ID: 1, Type: "demo"},
+		claimErr:  ErrNotClaimed,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+	q := &Queue{Store: st, Registry: reg, Inline: true}
+
+	job, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("expected nil error for ErrNotClaimed, got %v", err)
+	}
+	if job.ID != 1 {
+		t.Fatalf("expected job ID 1, got %d", job.ID)
+	}
+}
+
+func TestQueue_InlineMarkFailedError(t *testing.T) {
+	mfErr := errors.New("mark failed broken")
+	st := &recordingStore{
+		createJob:     Job{ID: 1, Type: "demo"},
+		claimJob:      Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		markFailedErr: mfErr,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return errors.New("handler err") })
+	q := &Queue{Store: st, Registry: reg, Inline: true}
+
+	_, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
+	if !errors.Is(err, mfErr) {
+		t.Fatalf("expected mark failed error, got %v", err)
+	}
+}
+
+func TestQueue_InlineMarkSucceededError(t *testing.T) {
+	msErr := errors.New("mark succeeded broken")
+	st := &recordingStore{
+		createJob:        Job{ID: 1, Type: "demo"},
+		claimJob:         Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		markSucceededErr: msErr,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+	q := &Queue{Store: st, Registry: reg, Inline: true}
+
+	_, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
+	if !errors.Is(err, msErr) {
+		t.Fatalf("expected mark succeeded error, got %v", err)
 	}
 }

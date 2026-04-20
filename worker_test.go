@@ -15,12 +15,14 @@ type memStore struct {
 	job Job
 
 	listIDs []int64
+	listErr error
 
 	claimed  bool
 	claimErr error
 
-	succeeded []int64
-	retried   []struct {
+	succeeded      []int64
+	markSucceedErr error
+	retried        []struct {
 		id    int64
 		err   string
 		runAt time.Time
@@ -41,6 +43,9 @@ func (m *memStore) CreateJob(ctx context.Context, typ string, payload json.RawMe
 func (m *memStore) ListRunnableIDs(ctx context.Context, limit int64) ([]int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	return append([]int64(nil), m.listIDs...), nil
 }
 
@@ -60,6 +65,9 @@ func (m *memStore) ClaimJob(ctx context.Context, id int64, lockedBy string, recl
 func (m *memStore) MarkSucceeded(ctx context.Context, id int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.markSucceedErr != nil {
+		return m.markSucceedErr
+	}
 	m.succeeded = append(m.succeeded, id)
 	return nil
 }
@@ -325,5 +333,93 @@ func TestWorker_RunCoordinatedNilGuards(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("nil registry RunCoordinated did not return")
+	}
+}
+
+func TestWorker_ErrNotClaimedSkips(t *testing.T) {
+	ms := &memStore{
+		listIDs: []int64{1},
+		job:     Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		claimed: true, // already claimed
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+
+	w := &Worker{Store: ms, Registry: reg, LockTTL: time.Minute}
+	err := w.processJobIDCoordinated(context.Background(), context.Background(), "w1", 1, time.Minute, DefaultBackoff)
+	if err != nil {
+		t.Fatalf("expected nil (skip), got %v", err)
+	}
+	if len(ms.succeeded) != 0 {
+		t.Fatalf("expected no succeeded calls, got %d", len(ms.succeeded))
+	}
+}
+
+func TestWorker_MaxAttemptsExceeded(t *testing.T) {
+	ms := &memStore{
+		listIDs: []int64{1},
+		job:     Job{ID: 1, Type: "demo", Attempts: 5, MaxAttempts: 5},
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+
+	w := &Worker{Store: ms, Registry: reg, LockTTL: time.Minute}
+	err := w.processJobIDCoordinated(context.Background(), context.Background(), "w1", 1, time.Minute, DefaultBackoff)
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.failed) != 1 {
+		t.Fatalf("expected 1 MarkFailed, got %d", len(ms.failed))
+	}
+	if ms.failed[0].err != "max attempts exceeded" {
+		t.Fatalf("expected 'max attempts exceeded', got %q", ms.failed[0].err)
+	}
+}
+
+func TestWorker_MarkSucceededError(t *testing.T) {
+	msErr := errors.New("disk full")
+	ms := &memStore{
+		listIDs:        []int64{1},
+		job:            Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		markSucceedErr: msErr,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+
+	w := &Worker{Store: ms, Registry: reg, LockTTL: time.Minute}
+	err := w.processJobIDCoordinated(context.Background(), context.Background(), "w1", 1, time.Minute, DefaultBackoff)
+	if !errors.Is(err, msErr) {
+		t.Fatalf("expected disk full error, got %v", err)
+	}
+}
+
+func TestWorker_ListRunnableIDsError(t *testing.T) {
+	listErr := errors.New("connection refused")
+	ms := &memStore{listErr: listErr}
+	reg := NewRegistry()
+
+	w := &Worker{Store: ms, Registry: reg, LockTTL: time.Minute}
+	err := w.runBatchCoordinated(context.Background(), context.Background(), "w1", 10, time.Minute, DefaultBackoff)
+	if !errors.Is(err, listErr) {
+		t.Fatalf("expected list error, got %v", err)
+	}
+}
+
+func TestWorker_BatchPropagatesProcessError(t *testing.T) {
+	dbErr := errors.New("db exploded")
+	ms := &memStore{
+		listIDs:  []int64{1, 2},
+		job:      Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		claimErr: dbErr,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+
+	w := &Worker{Store: ms, Registry: reg, LockTTL: time.Minute}
+	err := w.runBatchCoordinated(context.Background(), context.Background(), "w1", 10, time.Minute, DefaultBackoff)
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("expected db error propagated from batch, got %v", err)
 	}
 }
