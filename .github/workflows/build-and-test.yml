@@ -1,0 +1,33 @@
+name: Build & Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.25', '1.26']
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Display Go version
+        run: go version
+
+      - name: Install dependencies
+        run: go mod download
+      - name: Build
+        run: go build -v ./...
+      - name: Test with the Go CLI
+        run: go test -v ./...
