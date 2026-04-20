@@ -1,6 +1,6 @@
 module github.com/makadev/go-runner
 
-go 1.26.1
+go 1.25.0
 
 require modernc.org/sqlite v1.37.1
 
