@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func (s *recordingStore) ClaimJob(ctx context.Context, id int64, lockedBy string
 	return s.claimJob, nil
 }
 
-func (s *recordingStore) MarkSucceeded(ctx context.Context, id int64) error {
+func (s *recordingStore) MarkSucceeded(ctx context.Context, id int64, lockedBy string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.markSucceededErr != nil {
@@ -70,7 +71,7 @@ func (s *recordingStore) MarkSucceeded(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *recordingStore) MarkRetry(ctx context.Context, id int64, lastError string, runAt time.Time) error {
+func (s *recordingStore) MarkRetry(ctx context.Context, id int64, lockedBy string, lastError string, runAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.markRetryCalls = append(s.markRetryCalls, struct {
@@ -81,7 +82,7 @@ func (s *recordingStore) MarkRetry(ctx context.Context, id int64, lastError stri
 	return nil
 }
 
-func (s *recordingStore) MarkFailed(ctx context.Context, id int64, lastError string) error {
+func (s *recordingStore) MarkFailed(ctx context.Context, id int64, lockedBy string, lastError string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.markFailedErr != nil {
@@ -320,5 +321,42 @@ func TestQueue_InlineMarkSucceededError(t *testing.T) {
 	_, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
 	if !errors.Is(err, msErr) {
 		t.Fatalf("expected mark succeeded error, got %v", err)
+	}
+}
+
+func TestQueue_InlinePanicMarksFailed(t *testing.T) {
+	st := &recordingStore{
+		createJob: Job{ID: 1, Type: "demo"},
+		claimJob:  Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { panic("kaboom") })
+	q := &Queue{Store: st, Registry: reg, Inline: true}
+
+	_, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{})
+	var pe *PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *PanicError, got %v", err)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.markFailedCalls) != 1 {
+		t.Fatalf("expected 1 MarkFailed call, got %d", len(st.markFailedCalls))
+	}
+}
+
+func TestQueue_InlineLockLostOnSuccessIsNotAnError(t *testing.T) {
+	st := &recordingStore{
+		createJob:        Job{ID: 1, Type: "demo"},
+		claimJob:         Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		markSucceededErr: fmt.Errorf("store: %w", ErrLockLost),
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+	q := &Queue{Store: st, Registry: reg, Inline: true}
+
+	if _, err := q.Enqueue(context.Background(), "demo", map[string]any{}, EnqueueOptions{}); err != nil {
+		t.Fatalf("expected nil error on lost lock, got %v", err)
 	}
 }

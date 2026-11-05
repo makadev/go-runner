@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -22,6 +23,10 @@ type Queue struct {
 
 	// LockTTL is used to reclaim stuck running jobs in Inline mode.
 	LockTTL time.Duration
+
+	// FinalizeTimeout bounds the storage write that records an inline job's outcome.
+	// That write is not cancelled by ctx. Defaults to DefaultFinalizeTimeout.
+	FinalizeTimeout time.Duration
 }
 
 func (q *Queue) Enqueue(ctx context.Context, typ string, payload any, opt EnqueueOptions) (Job, error) {
@@ -84,24 +89,34 @@ func (q *Queue) runInline(ctx context.Context, id int64) error {
 		lockTTL = 15 * time.Minute
 	}
 
+	owner := newLockOwner(workerID)
 	reclaimBefore := time.Now().UTC().Add(-lockTTL)
-	job, err := q.Store.ClaimJob(ctx, id, workerID, reclaimBefore)
+	job, err := q.Store.ClaimJob(ctx, id, owner, reclaimBefore)
 	if err != nil {
-		if err == ErrNotClaimed {
+		if errors.Is(err, ErrNotClaimed) {
 			return nil
 		}
 		return err
 	}
 
-	if err := q.Registry.Handle(ctx, job); err != nil {
-		log.Warn("job failed (inline)", "id", job.ID, "type", job.Type, "attempts", job.Attempts, "err", err)
-		if err2 := q.Store.MarkFailed(ctx, job.ID, err.Error()); err2 != nil {
-			return err2
+	runErr := q.Registry.Handle(ctx, job)
+
+	fctx, cancel := finalizeContext(ctx, q.FinalizeTimeout)
+	defer cancel()
+
+	if runErr != nil {
+		logHandlerError(log, "job failed (inline)", job, runErr)
+		if err := q.Store.MarkFailed(fctx, job.ID, owner, runErr.Error()); err != nil && !errors.Is(err, ErrLockLost) {
+			return err
 		}
-		return err
+		return runErr
 	}
 
-	if err := q.Store.MarkSucceeded(ctx, job.ID); err != nil {
+	if err := q.Store.MarkSucceeded(fctx, job.ID, owner); err != nil {
+		if errors.Is(err, ErrLockLost) {
+			log.Warn("job lock lost, outcome discarded (inline)", "id", job.ID, "type", job.Type)
+			return nil
+		}
 		return err
 	}
 	log.Info("job succeeded (inline)", "id", job.ID, "type", job.Type)

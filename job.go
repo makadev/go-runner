@@ -25,6 +25,11 @@ var (
 	// ErrNotClaimed indicates the job could not be claimed, typically because another
 	// worker claimed it first or the job is not in a claimable state.
 	ErrNotClaimed = errors.New("runner: not claimed")
+
+	// ErrLockLost indicates that a job is no longer locked by the caller, typically
+	// because its lock expired and another worker reclaimed it. Storage implementations
+	// return it from MarkSucceeded, MarkRetry and MarkFailed instead of updating the job.
+	ErrLockLost = errors.New("runner: lock lost")
 )
 
 type Job struct {
@@ -56,4 +61,3 @@ type EnqueueOptions struct {
 	MaxAttempts    int64
 	IdempotencyKey *string
 }
-

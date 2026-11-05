@@ -96,3 +96,25 @@ func TestScheduler_RegisterPanics(t *testing.T) {
 		})
 	}
 }
+
+func TestScheduler_PanickingTaskKeepsRunning(t *testing.T) {
+	var calls atomic.Int64
+	s := &Scheduler{}
+	s.Register(Schedule{
+		Name:      "panics",
+		Every:     10 * time.Millisecond,
+		RunOnBoot: true,
+		Task: func(ctx context.Context) error {
+			calls.Add(1)
+			panic("kaboom")
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	s.Run(ctx)
+
+	if calls.Load() < 2 {
+		t.Fatalf("expected task to keep running after panic, got %d calls", calls.Load())
+	}
+}

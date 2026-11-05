@@ -33,6 +33,8 @@ func (r *Registry) Register(typ string, h Handler) {
 	r.handlers[typ] = h
 }
 
+// Handle dispatches job to the handler registered for job.Type.
+// A panicking handler is recovered and reported as a *PanicError.
 func (r *Registry) Handle(ctx context.Context, job Job) error {
 	r.mu.RLock()
 	h := r.handlers[job.Type]
@@ -40,5 +42,5 @@ func (r *Registry) Handle(ctx context.Context, job Job) error {
 	if h == nil {
 		return fmt.Errorf("runner: no handler registered for type %q", job.Type)
 	}
-	return h(ctx, job)
+	return callRecover(func() error { return h(ctx, job) })
 }
