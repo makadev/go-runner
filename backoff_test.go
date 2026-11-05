@@ -23,4 +23,3 @@ func TestDefaultBackoff(t *testing.T) {
 		}
 	}
 }
-

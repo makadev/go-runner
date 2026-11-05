@@ -21,4 +21,3 @@ func DefaultBackoff(attempts int64) time.Duration {
 		return 6 * time.Hour
 	}
 }
-
