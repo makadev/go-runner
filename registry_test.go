@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -55,5 +56,23 @@ func TestRegistry_RegisterPanics(t *testing.T) {
 			}
 			reg.Register(tc.typ, tc.h)
 		})
+	}
+}
+
+func TestRegistry_HandlerPanicBecomesPanicError(t *testing.T) {
+	reg := NewRegistry()
+	cause := errors.New("cause")
+	reg.Register("demo", func(context.Context, Job) error { panic(cause) })
+
+	err := reg.Handle(context.Background(), Job{Type: "demo"})
+	var pe *PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *PanicError, got %v", err)
+	}
+	if len(pe.Stack) == 0 {
+		t.Fatalf("expected stack trace")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("expected PanicError to unwrap to the panic value")
 	}
 }

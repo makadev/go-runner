@@ -62,13 +62,17 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, sc := range schedules {
-		sc := sc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
 			run := func() {
-				if err := sc.Task(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				err := callRecover(func() error { return sc.Task(ctx) })
+				var pe *PanicError
+				switch {
+				case errors.As(err, &pe):
+					log.Error("scheduled task panicked", "name", sc.Name, "panic", pe.Value, "stack", string(pe.Stack))
+				case err != nil && !errors.Is(err, context.Canceled):
 					log.Error("scheduled task failed", "name", sc.Name, "err", err)
 				}
 			}
@@ -93,4 +97,3 @@ func (s *Scheduler) Run(ctx context.Context) {
 	<-ctx.Done()
 	wg.Wait()
 }
-

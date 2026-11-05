@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -112,6 +113,9 @@ func (s *sqliteStore) ClaimJob(ctx context.Context, id int64, lockedBy string, r
 UPDATE jobs
 SET
   status = 'running',
+  -- A reclaimed job's previous attempt never finished: count it as a failed attempt.
+  attempts = attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END,
+  last_error = CASE WHEN status = 'running' THEN 'runner: lock expired, job reclaimed' ELSE last_error END,
   locked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
   locked_by = ?,
   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -139,34 +143,53 @@ RETURNING id, type, status, payload_json, idempotency_key, attempts, max_attempt
 	return j, nil
 }
 
-func (s *sqliteStore) MarkSucceeded(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='succeeded', last_error='', locked_at=NULL, locked_by='', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?`, id)
-	return err
+func (s *sqliteStore) MarkSucceeded(ctx context.Context, id int64, lockedBy string) error {
+	return s.finish(ctx, `UPDATE jobs SET status='succeeded', last_error='', locked_at=NULL, locked_by='', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=? AND status='running' AND locked_by=?`, id, lockedBy)
 }
 
-func (s *sqliteStore) MarkRetry(ctx context.Context, id int64, lastError string, runAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='pending', attempts=attempts+1, last_error=?, run_at=?, locked_at=NULL, locked_by='', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?`, lastError, runAt.UTC().Format(time.RFC3339Nano), id)
-	return err
+func (s *sqliteStore) MarkRetry(ctx context.Context, id int64, lockedBy string, lastError string, runAt time.Time) error {
+	return s.finish(ctx, `UPDATE jobs SET status='pending', attempts=attempts+1, last_error=?, run_at=?, locked_at=NULL, locked_by='', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=? AND status='running' AND locked_by=?`, lastError, runAt.UTC().Format(time.RFC3339Nano), id, lockedBy)
 }
 
-func (s *sqliteStore) MarkFailed(ctx context.Context, id int64, lastError string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='failed', attempts=attempts+1, last_error=?, locked_at=NULL, locked_by='', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?`, lastError, id)
-	return err
+func (s *sqliteStore) MarkFailed(ctx context.Context, id int64, lockedBy string, lastError string) error {
+	return s.finish(ctx, `UPDATE jobs SET status='failed', attempts=attempts+1, last_error=?, locked_at=NULL, locked_by='', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=? AND status='running' AND locked_by=?`, lastError, id, lockedBy)
+}
+
+// finish runs a lock-checked status update and reports ErrLockLost when no row matched.
+func (s *sqliteStore) finish(ctx context.Context, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLockLost
+	}
+	return nil
+}
+
+func (s *sqliteStore) getJob(ctx context.Context, id int64) (Job, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, type, status, payload_json, idempotency_key, attempts, max_attempts, last_error,
+  run_at, locked_at, locked_by, created_at, updated_at, finished_at FROM jobs WHERE id=?`, id)
+	return scanSQLiteJob(row)
 }
 
 type sqliteScanner interface{ Scan(dest ...any) error }
 
 func scanSQLiteJob(row sqliteScanner) (Job, error) {
 	var (
-		j              Job
-		statusStr      string
-		payloadStr     string
-		idem           sql.NullString
-		runAtStr       sql.NullString
-		lockedAtStr    sql.NullString
-		createdAtStr   string
-		updatedAtStr   string
-		finishedAtStr  sql.NullString
+		j             Job
+		statusStr     string
+		payloadStr    string
+		idem          sql.NullString
+		runAtStr      sql.NullString
+		lockedAtStr   sql.NullString
+		createdAtStr  string
+		updatedAtStr  string
+		finishedAtStr sql.NullString
 	)
 	err := row.Scan(
 		&j.ID, &j.Type, &statusStr, &payloadStr, &idem, &j.Attempts, &j.MaxAttempts, &j.LastError,
@@ -322,3 +345,145 @@ func TestSQLite_IdempotencyUnique(t *testing.T) {
 	}
 }
 
+// expireLock moves a running job's lock into the past so it can be reclaimed.
+func (s *sqliteStore) expireLock(t *testing.T, id int64) {
+	t.Helper()
+	_, err := s.db.Exec(`UPDATE jobs SET locked_at=? WHERE id=?`, time.Now().Add(-24*time.Hour).UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		t.Fatalf("expire lock: %v", err)
+	}
+}
+
+func TestSQLite_ReclaimCountsAttempt(t *testing.T) {
+	st, cleanup := newSQLiteStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	j, err := st.CreateJob(ctx, "demo", json.RawMessage(`{}`), EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	first, err := st.ClaimJob(ctx, j.ID, "w1/a", time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if first.Attempts != 0 {
+		t.Fatalf("first claim must not count an attempt, got %d", first.Attempts)
+	}
+
+	st.expireLock(t, j.ID)
+	reclaimed, err := st.ClaimJob(ctx, j.ID, "w2/b", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if reclaimed.Attempts != 1 {
+		t.Fatalf("expected reclaim to count the abandoned attempt, got %d", reclaimed.Attempts)
+	}
+	if reclaimed.LastError == "" {
+		t.Fatalf("expected last error to note the reclaim")
+	}
+}
+
+func TestSQLite_StaleOwnerCannotFinalize(t *testing.T) {
+	st, cleanup := newSQLiteStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	j, err := st.CreateJob(ctx, "demo", json.RawMessage(`{}`), EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := st.ClaimJob(ctx, j.ID, "w1/a", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	st.expireLock(t, j.ID)
+	if _, err := st.ClaimJob(ctx, j.ID, "w1/b", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+
+	// The first claim lost its lock, even though it has the same worker id prefix.
+	if err := st.MarkFailed(ctx, j.ID, "w1/a", "late"); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("expected ErrLockLost for stale owner, got %v", err)
+	}
+	if err := st.MarkSucceeded(ctx, j.ID, "w1/b"); err != nil {
+		t.Fatalf("current owner must be able to finalize: %v", err)
+	}
+	got, err := st.getJob(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusSucceeded {
+		t.Fatalf("expected succeeded, got %s", got.Status)
+	}
+}
+
+func TestSQLite_WorkerFailsJobThatKeepsAbandoningItsLock(t *testing.T) {
+	st, cleanup := newSQLiteStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	j, err := st.CreateJob(ctx, "poison", json.RawMessage(`{}`), EnqueueOptions{MaxAttempts: 2})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Simulate two attempts that crashed the worker before it could record an outcome.
+	for i := 0; i < 2; i++ {
+		if _, err := st.ClaimJob(ctx, j.ID, fmt.Sprintf("crashed/%d", i), time.Now().Add(-time.Minute)); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		st.expireLock(t, j.ID)
+	}
+
+	called := false
+	reg := NewRegistry()
+	reg.Register("poison", func(context.Context, Job) error { called = true; return nil })
+	w := &Worker{Store: st, Registry: reg}
+	if err := w.processJobIDCoordinated(ctx, ctx, "w1", j.ID, time.Minute, DefaultBackoff); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if called {
+		t.Fatalf("handler must not run once attempts are exhausted")
+	}
+	got, err := st.getJob(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Fatalf("expected failed, got %s (attempts=%d)", got.Status, got.Attempts)
+	}
+}
+
+func TestSQLite_WorkerEndToEndRetryThenSucceed(t *testing.T) {
+	st, cleanup := newSQLiteStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	j, err := st.CreateJob(ctx, "flaky", json.RawMessage(`{}`), EnqueueOptions{MaxAttempts: 3})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	runs := 0
+	reg := NewRegistry()
+	reg.Register("flaky", func(context.Context, Job) error {
+		runs++
+		if runs == 1 {
+			panic("first run panics")
+		}
+		return nil
+	})
+	w := &Worker{Store: st, Registry: reg}
+	noBackoff := func(int64) time.Duration { return -time.Second } // runnable right away
+
+	for i := 0; i < 2; i++ {
+		if err := w.runBatchCoordinated(ctx, ctx, "w1", 10, time.Minute, noBackoff); err != nil {
+			t.Fatalf("batch %d: %v", i, err)
+		}
+	}
+	got, err := st.getJob(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusSucceeded || got.Attempts != 1 {
+		t.Fatalf("expected succeeded after 1 failed attempt, got %s attempts=%d", got.Status, got.Attempts)
+	}
+}

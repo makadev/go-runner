@@ -1,5 +1,5 @@
-# https://github.com/devcontainers/images/blob/64c661113919646944a62880725f7179a51008ad/src/go/history/2.1.1.md#variant-126-trixie
-FROM mcr.microsoft.com/devcontainers/go:1.26-trixie
+# https://github.com/devcontainers/images/tree/main/src/go
+FROM mcr.microsoft.com/devcontainers/go:1.27-trixie
 
 # [Optional] Uncomment this section to install additional OS packages.
 # RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \

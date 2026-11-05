@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +21,10 @@ type memStore struct {
 
 	claimed  bool
 	claimErr error
+	owners   []string // lockedBy values passed to ClaimJob
+
+	finalizeCtxErrs []error // ctx.Err() observed by Mark* calls
+	lockLost        bool    // when set, Mark* return ErrLockLost
 
 	succeeded      []int64
 	markSucceedErr error
@@ -59,12 +65,17 @@ func (m *memStore) ClaimJob(ctx context.Context, id int64, lockedBy string, recl
 		return Job{}, ErrNotClaimed
 	}
 	m.claimed = true
+	m.owners = append(m.owners, lockedBy)
 	return m.job, nil
 }
 
-func (m *memStore) MarkSucceeded(ctx context.Context, id int64) error {
+func (m *memStore) MarkSucceeded(ctx context.Context, id int64, lockedBy string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finalizeCtxErrs = append(m.finalizeCtxErrs, ctx.Err())
+	if m.lockLost {
+		return ErrLockLost
+	}
 	if m.markSucceedErr != nil {
 		return m.markSucceedErr
 	}
@@ -72,9 +83,13 @@ func (m *memStore) MarkSucceeded(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (m *memStore) MarkRetry(ctx context.Context, id int64, lastError string, runAt time.Time) error {
+func (m *memStore) MarkRetry(ctx context.Context, id int64, lockedBy string, lastError string, runAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finalizeCtxErrs = append(m.finalizeCtxErrs, ctx.Err())
+	if m.lockLost {
+		return ErrLockLost
+	}
 	m.retried = append(m.retried, struct {
 		id    int64
 		err   string
@@ -83,9 +98,13 @@ func (m *memStore) MarkRetry(ctx context.Context, id int64, lastError string, ru
 	return nil
 }
 
-func (m *memStore) MarkFailed(ctx context.Context, id int64, lastError string) error {
+func (m *memStore) MarkFailed(ctx context.Context, id int64, lockedBy string, lastError string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finalizeCtxErrs = append(m.finalizeCtxErrs, ctx.Err())
+	if m.lockLost {
+		return ErrLockLost
+	}
 	m.failed = append(m.failed, struct {
 		id  int64
 		err string
@@ -421,5 +440,115 @@ func TestWorker_BatchPropagatesProcessError(t *testing.T) {
 	err := w.runBatchCoordinated(context.Background(), context.Background(), "w1", 10, time.Minute, DefaultBackoff)
 	if !errors.Is(err, dbErr) {
 		t.Fatalf("expected db error propagated from batch, got %v", err)
+	}
+}
+
+func TestWorker_HandlerPanicIsRecoveredAndRetried(t *testing.T) {
+	ms := &memStore{job: Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 3}}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { panic("kaboom") })
+
+	w := &Worker{Store: ms, Registry: reg}
+	ctx := context.Background()
+	if err := w.processJobIDCoordinated(ctx, ctx, "w1", 1, time.Minute, DefaultBackoff); err != nil {
+		t.Fatalf("expected nil error after recovered panic, got %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.retried) != 1 {
+		t.Fatalf("expected 1 retry after panic, got %d", len(ms.retried))
+	}
+	if ms.retried[0].err != "runner: panic: kaboom" {
+		t.Fatalf("unexpected last error %q", ms.retried[0].err)
+	}
+}
+
+func TestWorker_HardCancelFinalizesWithLiveContextAndRetriesNow(t *testing.T) {
+	ms := &memStore{job: Job{ID: 1, Type: "block", Attempts: 0, MaxAttempts: 10}}
+	reg := NewRegistry()
+	started := make(chan struct{})
+	reg.Register("block", func(ctx context.Context, j Job) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	w := &Worker{Store: ms, Registry: reg, Backoff: func(int64) time.Duration { return time.Hour }}
+	hard, cancelHard := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.processJobIDCoordinated(context.Background(), hard, "w1", 1, time.Minute, w.Backoff)
+	}()
+	<-started
+	before := time.Now().UTC()
+	cancelHard()
+	if err := <-errCh; err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.retried) != 1 {
+		t.Fatalf("expected 1 retry, got %d", len(ms.retried))
+	}
+	if ms.finalizeCtxErrs[0] != nil {
+		t.Fatalf("finalize context was already cancelled: %v", ms.finalizeCtxErrs[0])
+	}
+	if d := ms.retried[0].runAt.Sub(before); d > time.Minute {
+		t.Fatalf("expected immediate retry on shutdown, got runAt %v after cancel", d)
+	}
+}
+
+func TestWorker_WrappedErrNotClaimedSkips(t *testing.T) {
+	ms := &memStore{claimErr: fmt.Errorf("store: %w", ErrNotClaimed)}
+	reg := NewRegistry()
+	w := &Worker{Store: ms, Registry: reg}
+	ctx := context.Background()
+	if err := w.processJobIDCoordinated(ctx, ctx, "w1", 1, time.Minute, DefaultBackoff); err != nil {
+		t.Fatalf("expected wrapped ErrNotClaimed to be skipped, got %v", err)
+	}
+}
+
+func TestWorker_LockLostIsNotAnError(t *testing.T) {
+	ms := &memStore{
+		listIDs:  []int64{1},
+		job:      Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2},
+		lockLost: true,
+	}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+	w := &Worker{Store: ms, Registry: reg}
+	ctx := context.Background()
+	if err := w.runBatchCoordinated(ctx, ctx, "w1", 10, time.Minute, DefaultBackoff); err != nil {
+		t.Fatalf("expected nil error on lost lock, got %v", err)
+	}
+}
+
+func TestWorker_LockOwnerIsUniquePerClaim(t *testing.T) {
+	ms := &memStore{job: Job{ID: 1, Type: "demo", Attempts: 0, MaxAttempts: 2}}
+	reg := NewRegistry()
+	reg.Register("demo", func(ctx context.Context, j Job) error { return nil })
+	w := &Worker{Store: ms, Registry: reg}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		ms.mu.Lock()
+		ms.claimed = false
+		ms.mu.Unlock()
+		_ = w.processJobIDCoordinated(ctx, ctx, "w1", 1, time.Minute, DefaultBackoff)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if len(ms.owners) != 2 {
+		t.Fatalf("expected 2 claims, got %d", len(ms.owners))
+	}
+	if ms.owners[0] == ms.owners[1] {
+		t.Fatalf("expected distinct lock owners, got %q twice", ms.owners[0])
+	}
+	for _, o := range ms.owners {
+		if !strings.HasPrefix(o, "w1/") {
+			t.Fatalf("expected lock owner prefixed with worker id, got %q", o)
+		}
 	}
 }

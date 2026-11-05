@@ -25,6 +25,10 @@ type Worker struct {
 
 	// Backoff controls retry scheduling; defaults to DefaultBackoff when nil.
 	Backoff BackoffFunc
+
+	// FinalizeTimeout bounds the storage write that records a job's outcome.
+	// That write is not cancelled by the hard shutdown context. Defaults to DefaultFinalizeTimeout.
+	FinalizeTimeout time.Duration
 }
 
 // RunCoordinated runs the worker with separate soft/hard shutdown signals:
@@ -120,37 +124,73 @@ func (w *Worker) processJobIDCoordinated(softCtx, hardCtx context.Context, worke
 	default:
 	}
 
+	owner := newLockOwner(workerID)
 	reclaimBefore := time.Now().UTC().Add(-lockTTL)
-	job, err := w.Store.ClaimJob(softCtx, id, workerID, reclaimBefore)
+	job, err := w.Store.ClaimJob(softCtx, id, owner, reclaimBefore)
 	if err != nil {
-		if err == ErrNotClaimed {
+		if errors.Is(err, ErrNotClaimed) {
 			return nil
 		}
 		return err
 	}
 
 	if job.Attempts >= job.MaxAttempts {
-		_ = w.Store.MarkFailed(hardCtx, job.ID, "max attempts exceeded")
-		return nil
+		log.Warn("job failed: max attempts exceeded", "id", job.ID, "type", job.Type, "attempts", job.Attempts, "last_error", job.LastError)
+		return w.finalize(hardCtx, log, job, func(ctx context.Context) error {
+			return w.Store.MarkFailed(ctx, job.ID, owner, "max attempts exceeded")
+		})
 	}
 
-	if err := w.Registry.Handle(hardCtx, job); err != nil {
-		log.Warn("job failed", "id", job.ID, "type", job.Type, "attempts", job.Attempts, "err", err)
-		return w.failOrRetry(hardCtx, job, err, backoff)
+	if runErr := w.Registry.Handle(hardCtx, job); runErr != nil {
+		logHandlerError(log, "job failed", job, runErr)
+		return w.finalize(hardCtx, log, job, func(ctx context.Context) error {
+			return w.failOrRetry(ctx, job, owner, runErr, backoff, hardCtx.Err() != nil)
+		})
 	}
 
-	if err := w.Store.MarkSucceeded(hardCtx, job.ID); err != nil {
+	if err := w.finalize(hardCtx, log, job, func(ctx context.Context) error {
+		return w.Store.MarkSucceeded(ctx, job.ID, owner)
+	}); err != nil {
 		return err
 	}
 	log.Info("job succeeded", "id", job.ID, "type", job.Type)
 	return nil
 }
 
-func (w *Worker) failOrRetry(ctx context.Context, job Job, runErr error, backoff BackoffFunc) error {
+// finalize records a job's outcome. The write uses a context detached from hardCtx,
+// so the outcome is still persisted during a hard shutdown instead of leaving the job
+// in "running" until its lock expires. ErrLockLost is logged and not treated as an error.
+func (w *Worker) finalize(hardCtx context.Context, log *slog.Logger, job Job, write func(ctx context.Context) error) error {
+	ctx, cancel := finalizeContext(hardCtx, w.FinalizeTimeout)
+	defer cancel()
+	err := write(ctx)
+	if errors.Is(err, ErrLockLost) {
+		log.Warn("job lock lost, outcome discarded", "id", job.ID, "type", job.Type)
+		return nil
+	}
+	return err
+}
+
+// failOrRetry marks the job failed when its attempts are used up and schedules a retry otherwise.
+// When shuttingDown is set the handler was interrupted by the hard shutdown, so the retry is
+// scheduled immediately instead of after the backoff delay.
+func (w *Worker) failOrRetry(ctx context.Context, job Job, owner string, runErr error, backoff BackoffFunc, shuttingDown bool) error {
 	nextAttempts := job.Attempts + 1
 	if nextAttempts >= job.MaxAttempts {
-		return w.Store.MarkFailed(ctx, job.ID, runErr.Error())
+		return w.Store.MarkFailed(ctx, job.ID, owner, runErr.Error())
 	}
-	next := time.Now().UTC().Add(backoff(job.Attempts))
-	return w.Store.MarkRetry(ctx, job.ID, runErr.Error(), next)
+	next := time.Now().UTC()
+	if !shuttingDown {
+		next = next.Add(backoff(job.Attempts))
+	}
+	return w.Store.MarkRetry(ctx, job.ID, owner, runErr.Error(), next)
+}
+
+func logHandlerError(log *slog.Logger, msg string, job Job, err error) {
+	var pe *PanicError
+	if errors.As(err, &pe) {
+		log.Error(msg+" (panic)", "id", job.ID, "type", job.Type, "attempts", job.Attempts, "panic", pe.Value, "stack", string(pe.Stack))
+		return
+	}
+	log.Warn(msg, "id", job.ID, "type", job.Type, "attempts", job.Attempts, "err", err)
 }

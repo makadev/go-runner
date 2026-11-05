@@ -59,7 +59,14 @@ _, _ = q.Enqueue(ctx, "demo.echo", map[string]any{"msg": "hello"}, runner.Enqueu
 - **`EnqueueOptions.MaxAttempts`**: when `MaxAttempts <= 0`, runner defaults it to **8**.
 - **Inline mode**: when `Queue.Inline=true`, runner attempts the job **once** immediately after enqueue.
   If the handler returns an error, the job is marked **failed** right away (no retry/backoff loop in inline mode).
-- **`Worker.WorkerID`**: when empty, runner uses `"worker"` as the lock owner identifier.
+- **`Worker.WorkerID`**: when empty, runner uses `"worker"`. The lock owner stored with a claim is
+  `<WorkerID>/<random token>` and unique per claim, so a worker whose lock expired cannot overwrite
+  the outcome of a job that was reclaimed in the meantime (even when several workers share an ID).
+- **Panics**: a panicking handler or scheduled task is recovered and reported as `*runner.PanicError`
+  (with stack trace). In worker mode the job is retried like any other failure; it does not crash the process.
+- **Shutdown**: the outcome of a job (`MarkSucceeded`/`MarkRetry`/`MarkFailed`) is written with a context
+  that is not cancelled by `hardCtx`, bounded by `Worker.FinalizeTimeout` (default 10s). A handler interrupted
+  by the hard shutdown is rescheduled to run again immediately (it still counts as an attempt).
 - **Retries/backoff**: on handler error in worker mode, runner schedules a retry via `Storage.MarkRetry` using `Worker.Backoff`.
   When `Worker.Backoff` is nil, runner uses `DefaultBackoff`: 1m, 5m, 15m, 1h, then 6h for all subsequent retries.
 
@@ -95,7 +102,13 @@ The `runner.Storage` interface is the portability boundary. Implementations **mu
 
 - **Atomic claim**: `ClaimJob` must ensure only one worker can claim a given job.
 - **TTL reclaim**: `ClaimJob` must allow reclaiming stuck `running` jobs where `locked_at <= reclaimRunningBefore`.
+  When it reclaims a job it must **increment attempts**: the previous attempt never finished (crash, OOM, kill)
+  and counts as failed. Otherwise a job that reliably kills its worker would be retried forever.
+- **Lock owner**: `ClaimJob` stores `lockedBy`. `MarkSucceeded`, `MarkRetry` and `MarkFailed` must only update
+  the job while it is `running` and `locked_by = lockedBy`; otherwise they must leave it unchanged and return
+  `runner.ErrLockLost`.
 - **Attempts accounting**: `MarkRetry` and `MarkFailed` must increment attempts (attempts live in storage).
+- **Errors**: returned errors may be wrapped; runner checks `ErrNotClaimed`/`ErrLockLost` with `errors.Is`.
 - **Idempotency**: when `EnqueueOptions.IdempotencyKey` is provided, `CreateJob` must enforce uniqueness.
 - **Semantics**: this is **at-least-once** delivery; handlers must be idempotent.
 - **Scheduling**: `ListRunnableIDs` must only return jobs that are runnable now (for example, `status='pending'` and `run_at IS NULL OR run_at <= now`).
@@ -146,17 +159,24 @@ func (s SQLiteStore) ListRunnableIDs(ctx context.Context, limit int64) ([]int64,
 }
 
 func (s SQLiteStore) ClaimJob(ctx context.Context, id int64, lockedBy string, reclaimRunningBefore time.Time) (runner.Job, error) {
-	// UPDATE ... WHERE (pending OR (running AND locked_at<=reclaimBefore)) RETURNING ...
+	// UPDATE jobs SET status='running', locked_by=?, locked_at=now,
+	//   attempts = attempts + CASE WHEN status='running' THEN 1 ELSE 0 END  -- reclaim counts an attempt
+	// WHERE id=? AND (status='pending' OR (status='running' AND locked_at<=reclaimBefore)) RETURNING ...
 	// If no rows updated/returned: return runner.ErrNotClaimed
 }
 
-func (s SQLiteStore) MarkSucceeded(ctx context.Context, id int64) error { /* UPDATE status + clear lock */ return nil }
-func (s SQLiteStore) MarkRetry(ctx context.Context, id int64, lastError string, runAt time.Time) error {
-	// UPDATE status='pending', attempts=attempts+1, run_at=...
+// All Mark* updates add: WHERE id=? AND status='running' AND locked_by=?
+// If no row was affected: return runner.ErrLockLost
+func (s SQLiteStore) MarkSucceeded(ctx context.Context, id int64, lockedBy string) error {
+	// UPDATE status='succeeded', clear lock, finished_at=...
 	return nil
 }
-func (s SQLiteStore) MarkFailed(ctx context.Context, id int64, lastError string) error {
-	// UPDATE status='failed', attempts=attempts+1, finished_at=...
+func (s SQLiteStore) MarkRetry(ctx context.Context, id int64, lockedBy string, lastError string, runAt time.Time) error {
+	// UPDATE status='pending', attempts=attempts+1, run_at=..., clear lock
+	return nil
+}
+func (s SQLiteStore) MarkFailed(ctx context.Context, id int64, lockedBy string, lastError string) error {
+	// UPDATE status='failed', attempts=attempts+1, finished_at=..., clear lock
 	return nil
 }
 ```
